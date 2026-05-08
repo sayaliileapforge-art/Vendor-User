@@ -225,37 +225,55 @@ function normalize(str: string): string {
 
 /**
  * Extract a normalised key from an image filename for matching.
- * Strips the file extension, then strips any leading roll-number / serial
- * prefix (digits followed by optional separators), then runs normalize().
+ * 1. Decode URL encoding (%20 → space, etc.)
+ * 2. Strip file extension
+ * 3. Strip ALL leading roll/serial number prefixes (handles "145_36_" etc.)
+ * 4. Run normalize()
  *
  * Examples:
- *   "145_Vanshika_Katiyar.jpg"  → "vanshikakatiyar"
- *   "145__vanshika_katiyar.jpg" → "vanshikakatiyar"
- *   "vanshika_katiyar.jpg"      → "vanshikakatiyar"
- *   "vanshikakatiyar.jpg"       → "vanshikakatiyar"
+ *   "145_36_Avni%20Pal_.jpg"   → "avnipal"
+ *   "145_36_avni_pal.jpg"      → "avnipal"
+ *   "145_Vanshika_Katiyar.jpg" → "vanshikakatiyar"
+ *   "vanshika_katiyar.jpg"     → "vanshikakatiyar"
  */
 function normalizeFilename(filename: string): string {
-  const noExt = path.basename(filename, path.extname(filename));
-  // Drop leading roll/serial numbers (e.g. "145_", "12__", "2024-01_")
-  const noPrefix = noExt.replace(/^\d+[_\s.\-]*/g, '');
+  // Decode URL-encoded characters first (%20 → space, etc.)
+  let decoded = filename;
+  try { decoded = decodeURIComponent(filename); } catch { /* keep original */ }
+  const noExt    = path.basename(decoded, path.extname(decoded));
+  // Strip ALL leading digit+separator segments (e.g. "145_36_" not just "145_")
+  const noPrefix = noExt.replace(/^(\d+[_\s.\-]*)+/, '');
   return normalize(noPrefix);
 }
 
 /** Extract the student name from a DataRecord variables object.
- *  Checks common column name variations (CSV headers vary by school). */
+ *  Checks common column name variations (CSV headers vary by school).
+ *  Falls back to case-insensitive key scan for headers like "STUDENT NAME". */
 function getRecordName(vars: Record<string, unknown>): string {
-  const raw = String(
-    vars['Name']        ??
-    vars['name']        ??
-    vars['StudentName'] ??
-    vars['studentName'] ??
-    vars['student_name']??
-    vars['FullName']    ??
-    vars['fullName']    ??
-    vars['full_name']   ??
+  // Fast path: exact key match
+  const direct = String(
+    vars['Name']         ??
+    vars['name']         ??
+    vars['StudentName']  ??
+    vars['studentName']  ??
+    vars['student_name'] ??
+    vars['FullName']     ??
+    vars['fullName']     ??
+    vars['full_name']    ??
+    vars['Student Name'] ??
+    vars['student name'] ??
+    vars['STUDENT NAME'] ??
+    vars['Full Name']    ??
     ''
   ).trim();
-  return raw.toLowerCase();
+  if (direct) return direct.toLowerCase();
+
+  // Fallback: case-insensitive scan for any name-like key
+  const namePattern = /^(student\s*name|full\s*name|name)$/i;
+  for (const [key, val] of Object.entries(vars)) {
+    if (namePattern.test(key.trim()) && val) return String(val).trim().toLowerCase();
+  }
+  return '';
 }
 
 type ZipResultStatus = 'matched' | 'unmatched' | 'error';
@@ -437,14 +455,26 @@ router.post('/zip', async (req: Request, res: Response): Promise<void> => {
           await DataRecord.updateOne({ _id: matchRec._id }, { $set: { variables: updatedVars } });
 
           const matchedName = getRecordName(vars) || filename;
-          console.log(`[upload-images/zip] ✓ Matched "${filename}" → "${matchedName}"   URL: ${url}`);
+          console.log(`[upload-images/zip] ✓ MATCHED  "${filename}" (key="${cleanName}") → "${matchedName}"  URL: ${url}`);
           results.push({ filename, url, matchedName, matchedId: String(matchRec._id), status: 'matched' });
           matched++;
         } else {
-          console.log(`[upload-images/zip] ✗ Unmatched "${filename}" (cleaned: "${cleanName}")`);
+          console.warn(`[upload-images/zip] ✗ UNMATCHED "${filename}" (key="${cleanName}") — no record found`);
           results.push({ filename, url, status: 'unmatched' });
           unmatched++;
         }
+      }
+
+      // Summary log — list all DB records that still have no photo
+      const unmatchedRecords = await DataRecord.find(
+        { projectId: projectOid, category, 'variables.photo': { $exists: false } },
+        { 'variables.Name': 1, 'variables.name': 1, 'variables.StudentName': 1 }
+      ).lean();
+      if (unmatchedRecords.length > 0) {
+        const names = unmatchedRecords.map((r) => getRecordName((r.variables || {}) as Record<string, unknown>) || '(no name)');
+        console.warn(`[upload-images/zip] ⚠ ${unmatchedRecords.length} record(s) still have no photo: ${names.slice(0, 20).join(', ')}${names.length > 20 ? ' …' : ''}`);
+      } else {
+        console.log(`[upload-images/zip] ✅ All records now have a photo.`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

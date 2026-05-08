@@ -54,16 +54,30 @@ export function matchRowsWithImages(
 
     // 1. Exact match
     if (imageMap.has(rowName)) {
-      return { row, matchedImage: imageMap.get(rowName) };
+      const img = imageMap.get(rowName)!;
+      log.info(`✓ MATCHED  name="${rowName}" → "${img}"`);
+      return { row, matchedImage: img };
     }
 
     // 2. Substring match — handles extra tokens (middle names, initials, etc.)
+    // Prefer exact over partial: try longest key that is a subset first
+    let bestMatch: string | undefined;
+    let bestMatchKey = '';
     for (const [key, originalFilename] of imageMap) {
       if (key && (rowName.includes(key) || key.includes(rowName))) {
-        return { row, matchedImage: originalFilename };
+        // Prefer the longer / more specific key
+        if (key.length > bestMatchKey.length) {
+          bestMatch = originalFilename;
+          bestMatchKey = key;
+        }
       }
     }
+    if (bestMatch) {
+      log.info(`~ PARTIAL  name="${rowName}" (key="${bestMatchKey}") → "${bestMatch}"`);
+      return { row, matchedImage: bestMatch };
+    }
 
+    log.warn(`✗ UNMATCHED  name="${rowName}" — no image found`);
     return { row };
   });
 }
