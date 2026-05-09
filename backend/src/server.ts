@@ -155,6 +155,21 @@ async function startServer() {
       ]);
       console.log('✓ Seeded default ProductTemplate');
     }
+
+    // --- MIGRATION: promote root templates (no projectId) to isGlobal=true ---
+    // This ensures the Gallery shows all templates that aren't scoped to a specific project.
+    // Safe to run on every startup — only updates documents that need it.
+    try {
+      const promoted = await ProductTemplate.updateMany(
+        { projectId: null, isGlobal: { $ne: true } },
+        { $set: { isGlobal: true } },
+      );
+      if (promoted.modifiedCount > 0) {
+        console.log(`✓ Promoted ${promoted.modifiedCount} root template(s) to isGlobal=true`);
+      }
+    } catch (migErr) {
+      console.warn('! Could not promote root templates to global (non-fatal):', (migErr as Error).message);
+    }
     if (hasPostgresConfig()) {
       await testAuthDbConnection();
       await initAuthSchema();

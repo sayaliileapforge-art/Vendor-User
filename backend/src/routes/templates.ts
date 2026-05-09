@@ -205,7 +205,10 @@ router.get('/', async (req: Request, res: Response) => {
       filter = { $or: projectConditions };
     } else {
       // Gallery mode (no productId / projectId): only return public global templates.
-      // This prevents project-specific copies and clones from polluting the gallery.
+      // The { isGlobal: 1, updatedAt: -1 } compound index makes this fast and avoids
+      // the 32 MB in-memory sort limit on Atlas free tier.
+      // Root templates (no projectId) are automatically promoted to isGlobal=true at
+      // server startup (see server.ts ensureRootTemplatesAreGlobal()).
       filter = { isGlobal: true };
     }
 
