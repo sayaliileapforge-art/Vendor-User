@@ -71,4 +71,9 @@ ProductTemplateSchema.index(
   { unique: true, partialFilterExpression: { productId: { $type: 'objectId' } } }
 );
 
+// Compound indexes for fast gallery and project-specific queries
+ProductTemplateSchema.index({ isGlobal: 1, updatedAt: -1 });
+ProductTemplateSchema.index({ projectId: 1, isGlobal: 1, updatedAt: -1 });
+ProductTemplateSchema.index({ projectId: 1, updatedAt: -1 });
+
 export default mongoose.model<IProductTemplate>('ProductTemplate', ProductTemplateSchema);

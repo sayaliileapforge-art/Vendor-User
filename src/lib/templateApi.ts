@@ -126,6 +126,15 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return json.data as T;
 }
 
+/** Creates an AbortController that automatically aborts after `ms` milliseconds. */
+function withTimeout(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const id = window.setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, clear: () => window.clearTimeout(id) };
+}
+
+const FETCH_TIMEOUT_MS = 15_000;
+
 export async function getTemplatesByProductId(productId: string, params?: { category?: string; search?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
   if (params?.category) query.set('category', params.category);
@@ -133,37 +142,67 @@ export async function getTemplatesByProductId(productId: string, params?: { cate
   const queryString = query.toString();
 
   const requestUrl = `${TEMPLATE_API_BASE}/product/${productId}${queryString ? `?${queryString}` : ''}`;
-  const response = await fetch(requestUrl, { cache: 'no-store' });
-  const payload = await handleResponse<TemplateRecord[]>(response);
+  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(requestUrl, { cache: 'no-store', signal });
+    const payload = await handleResponse<TemplateRecord[]>(response);
 
-  console.info('[templateApi] /api/templates response', {
-    url: requestUrl,
-    status: response.status,
-    count: Array.isArray(payload) ? payload.length : 0,
-  });
+    console.info('[templateApi] /api/templates response', {
+      url: requestUrl,
+      status: response.status,
+      count: Array.isArray(payload) ? payload.length : 0,
+    });
 
-  return payload;
+    return payload;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Template request timed out. Please try again.');
+    }
+    throw err;
+  } finally {
+    clear();
+  }
 }
 
 export async function getTemplates(params?: { productId?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
   if (params?.productId) query.set('productId', params.productId);
   const requestUrl = `${TEMPLATE_API_BASE}${query.toString() ? `?${query}` : ''}`;
-  const response = await fetch(requestUrl, { cache: 'no-store' });
-  const payload = await handleResponse<TemplateRecord[]>(response);
-  console.info('[templateApi] GET templates', {
-    url: requestUrl,
-    status: response.status,
-    count: Array.isArray(payload) ? payload.length : 0,
-  });
-  return payload;
+  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(requestUrl, { cache: 'no-store', signal });
+    const payload = await handleResponse<TemplateRecord[]>(response);
+    console.info('[templateApi] GET templates', {
+      url: requestUrl,
+      status: response.status,
+      count: Array.isArray(payload) ? payload.length : 0,
+    });
+    return payload;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Template request timed out. Please try again.');
+    }
+    throw err;
+  } finally {
+    clear();
+  }
 }
 
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
-  const response = await fetch(requestUrl, { cache: 'no-store' });
-  console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
-  return handleResponse<TemplateRecord>(response);
+  const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(requestUrl, { cache: 'no-store', signal });
+    console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
+    return handleResponse<TemplateRecord>(response);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Template request timed out. Please try again.');
+    }
+    throw err;
+  } finally {
+    clear();
+  }
 }
 
 export async function createTemplate(input: TemplateSaveInput): Promise<TemplateRecord & { alreadyExists?: boolean }> {

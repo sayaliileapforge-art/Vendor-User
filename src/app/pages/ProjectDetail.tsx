@@ -722,11 +722,14 @@ export function ProjectDetail() {
       return;
     }
 
+    const controller = new AbortController();
+    const timeoutId  = window.setTimeout(() => controller.abort(), 15_000);
+
     const requestUrl = `${API_BASE}/templates?projectId=${encodeURIComponent(id)}`;
     setRemoteTemplatesLoading(true);
     setRemoteTemplatesError("");
 
-    fetch(requestUrl, { cache: 'no-store' })
+    fetch(requestUrl, { cache: 'no-store', signal: controller.signal })
       .then(async (response) => {
         const json = await response.json();
         if (!response.ok || json?.success === false) {
@@ -775,16 +778,27 @@ export function ProjectDetail() {
       })
       .catch((error) => {
         if (!mounted) return;
+        const isAbort = error instanceof Error && error.name === 'AbortError';
         console.warn("[preview] Failed to load templates", error);
-        setRemoteTemplates([]);
-        setRemoteTemplatesError((error as Error).message || "Failed to load templates");
+        // On timeout keep any existing optimistic template state rather than clearing it.
+        if (!isAbort) {
+          setRemoteTemplates([]);
+        }
+        setRemoteTemplatesError(
+          isAbort
+            ? "Template load timed out. Please refresh the page."
+            : (error as Error).message || "Failed to load templates"
+        );
       })
       .finally(() => {
+        window.clearTimeout(timeoutId);
         if (mounted) setRemoteTemplatesLoading(false);
       });
 
     return () => {
       mounted = false;
+      window.clearTimeout(timeoutId);
+      controller.abort();
     };
   // location.key changes on every navigation — ensures a fresh fetch when the user
   // returns from Template Gallery to this same project URL.
@@ -923,11 +937,19 @@ export function ProjectDetail() {
       }, 250);
     });
 
+    // Polling fallback: re-fetch templates every 30 s in case SSE is not reliable in production.
+    const pollInterval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        refresh();
+      }
+    }, 30_000);
+
     return () => {
       if (realtimeRefreshRef.current) {
         window.clearTimeout(realtimeRefreshRef.current);
         realtimeRefreshRef.current = null;
       }
+      window.clearInterval(pollInterval);
       unsubscribe();
     };
   }, [id]);
@@ -1034,9 +1056,12 @@ export function ProjectDetail() {
     } catch (error) {
       console.warn("[templates] Failed to persist project template to MongoDB", error);
       toast.error("Template could not be saved to the server.");
+      // Only refresh on failure so the UI reflects the actual DB state.
+      // On success the optimistic setRemoteTemplates update is the source of truth
+      // until the user returns from Designer Studio (which triggers a fresh fetch via location.key).
+      refresh();
     } finally {
       setIsTemplateSaving(false);
-      refresh();
     }
   };
 

@@ -382,6 +382,8 @@ export function TemplateGallery() {
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState("");
   const realtimeRefreshRef = useRef<number | null>(null);
+  const lastFetchTimeRef   = useRef<number>(0);
+  const pollingIntervalRef = useRef<number | null>(null);
 
   // Sidebar filters
   const [selectedCategories, setSelectedCategories] = useState<string[]>(["all"]);
@@ -410,6 +412,11 @@ export function TemplateGallery() {
   const [isDeleting, setIsDeleting]                       = useState(false);
 
   const fetchTemplates = useCallback(() => {
+    // Prevent overlapping concurrent fetches (e.g. SSE + polling both firing at once).
+    const now = Date.now();
+    if (now - lastFetchTimeRef.current < 500) return;
+    lastFetchTimeRef.current = now;
+
     setLoading(true);
     setError("");
     getTemplates()
@@ -429,6 +436,7 @@ export function TemplateGallery() {
           return true;
         });
         setTemplates(unique);
+        setError("");
       })
       .catch((err) => setError((err as Error).message ?? "Failed to load templates"))
       .finally(() => setLoading(false));
@@ -438,6 +446,7 @@ export function TemplateGallery() {
     fetchTemplates();
   }, [fetchTemplates]);
 
+  // SSE real-time updates: refresh gallery when templates change on the server.
   useEffect(() => {
     const unsubscribe = subscribeToTemplateUpdates(undefined, () => {
       if (realtimeRefreshRef.current) return;
@@ -453,6 +462,24 @@ export function TemplateGallery() {
         realtimeRefreshRef.current = null;
       }
       unsubscribe();
+    };
+  }, [fetchTemplates]);
+
+  // Polling fallback: refresh every 30 seconds in case SSE is unavailable in production
+  // (e.g. Render's HTTP proxy drops long-lived connections).
+  useEffect(() => {
+    pollingIntervalRef.current = window.setInterval(() => {
+      // Only poll when the tab is visible to avoid unnecessary requests while backgrounded.
+      if (document.visibilityState === 'visible') {
+        fetchTemplates();
+      }
+    }, 30_000);
+
+    return () => {
+      if (pollingIntervalRef.current !== null) {
+        window.clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
     };
   }, [fetchTemplates]);
 
@@ -826,7 +853,15 @@ export function TemplateGallery() {
 
           {/* Error */}
           {error && (
-            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <span>{error}</span>
+              <button
+                onClick={() => { lastFetchTimeRef.current = 0; fetchTemplates(); }}
+                className="shrink-0 rounded-lg border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 transition-colors"
+              >
+                Retry
+              </button>
+            </div>
           )}
 
           {/* Recommended row (All tab only) */}

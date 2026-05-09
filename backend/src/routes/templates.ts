@@ -111,6 +111,25 @@ function resolvePreviewImage(payload: Record<string, any>): string {
   return String(payload.preview_image || payload.previewImageUrl || payload.imageUrl || '').trim();
 }
 
+/**
+ * Normalise preview fields on plain objects returned by .lean() queries.
+ * The Mongoose toJSON transform only runs on hydrated documents, not lean results.
+ */
+function normalizeLeanTemplate(t: Record<string, any>): Record<string, any> {
+  const preview = t.preview_image || t.previewImageUrl || '';
+  if (preview) {
+    t.preview_image = preview;
+    t.previewImageUrl = preview;
+  }
+  return t;
+}
+
+// Fields included in gallery list responses — excludes designData (can be megabytes of canvas JSON).
+// Full designData is only fetched when a specific template is opened (GET /:id or project-specific list).
+const GALLERY_SELECT_FIELDS =
+  '_id productId projectId templateName description category ' +
+  'previewImageUrl preview_image designFileUrl isGlobal isActive tags createdAt updatedAt';
+
 function parseJsonField<T>(value: unknown, fallback: T): T {
   if (value == null) return fallback;
   if (typeof value === 'string') {
@@ -159,6 +178,8 @@ router.get('/', async (req: Request, res: Response) => {
       query: req.query,
     });
 
+    const isGalleryMode = !requestedProductId && !requestedProjectId;
+
     // Fetch templates by projectId or productId
     let filter: Record<string, any> = {};
     if (requestedProductId) {
@@ -187,21 +208,38 @@ router.get('/', async (req: Request, res: Response) => {
       // This prevents project-specific copies and clones from polluting the gallery.
       filter = { isGlobal: true };
     }
-    const rawTemplates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+
+    // Gallery mode: exclude designData (can be megabytes of canvas JSON per template) and use
+    // lean() for 3-5x faster query execution. Full designData is fetched on-demand via GET /:id.
+    // Project/product mode: return full documents (including designData) so the frontend can render
+    // previews immediately, but still use lean() for lower memory overhead.
+    const rawTemplates = isGalleryMode
+      ? await ProductTemplate
+          .find(filter)
+          .select(GALLERY_SELECT_FIELDS)
+          .sort({ updatedAt: -1 })
+          .lean<Array<Record<string, any>>>()
+      : await ProductTemplate
+          .find(filter)
+          .sort({ updatedAt: -1 })
+          .lean<Array<Record<string, any>>>();
+
+    // Normalize preview fields — Mongoose toJSON transform doesn't run on lean() results.
+    const normalizedTemplates = rawTemplates.map(normalizeLeanTemplate);
 
     // Deduplicate by name only in gallery mode (no productId / projectId filter).
     // When fetching project-specific templates, all records must be returned regardless of name
     // so that a project copy with the same name as the global template is not silently dropped.
-    const isGalleryMode = !requestedProductId && !requestedProjectId;
     const seenNames = new Set<string>();
     const templates = isGalleryMode
-      ? rawTemplates.filter((t) => {
-          const key = t.templateName.trim().toLowerCase();
+      ? normalizedTemplates.filter((t) => {
+          const key = String(t.templateName || '').trim().toLowerCase();
           if (seenNames.has(key)) return false;
           seenNames.add(key);
           return true;
         })
-      : rawTemplates;
+      : normalizedTemplates;
+
     console.log('[templates] Templates found', {
       count: templates.length,
       ids: templates.map((template) => String(template._id)),
@@ -245,14 +283,15 @@ router.get('/product/:productId', async (req: Request, res: Response) => {
       collection: 'producttemplates',
     });
 
-    const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 });
+    const templates = await ProductTemplate.find(filter).sort({ updatedAt: -1 }).lean<Array<Record<string, any>>>();
+    const normalizedTemplates = templates.map(normalizeLeanTemplate);
     res.setHeader('Cache-Control', 'no-store');
     console.log('[templates] Query result', {
       productId,
-      count: templates.length,
-      templateIds: templates.map((t) => String(t._id)),
+      count: normalizedTemplates.length,
+      templateIds: normalizedTemplates.map((t) => String(t._id)),
     });
-    res.json({ success: true, data: templates });
+    res.json({ success: true, data: normalizedTemplates });
   } catch (error) {
     const err = error as Error;
     console.error('[templates] GET /api/templates/product/:productId failed', {
