@@ -3,8 +3,8 @@ services:
     name: enterprise-saas-app
     runtime: node
     rootDir: .
-    buildCommand: npm ci --include=dev && npm --prefix backend ci --include=dev && npm run build:all
-    startCommand: npm run start:render
+    buildCommand: NODE_OPTIONS=--max-old-space-size=400 npm ci --include=dev && npm --prefix backend ci --include=dev && npm run build:all
+    startCommand: node --max-old-space-size=450 backend/dist/server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
