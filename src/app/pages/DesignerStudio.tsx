@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, type DragEvent } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams, useLocation } from "react-router";
 import * as fabric from "fabric";
 import jsPDF from "jspdf";
 import {
@@ -11,7 +11,7 @@ import {
   AlignStartHorizontal, AlignCenterHorizontal, AlignEndHorizontal,
   Undo2, Redo2, Copy, Trash2, Download, FolderOpen, Plus, X, Eye,
   ChevronDown, ChevronLeft, ChevronRight, Save, Globe, Pencil,
-  FileImage, Palette, SlidersHorizontal, LayoutGrid, Rows3,
+  FileImage, Palette, SlidersHorizontal, LayoutGrid, Rows3, Loader2,
 } from "lucide-react";
 import { Button } from "../components/ui/button";
 import {
@@ -54,7 +54,7 @@ import {
   loadProjects, type Project, type ProjectTemplate,
 } from "../../lib/projectStore";
 import { fetchProjects as apiFetchProjects } from "../../lib/apiService";
-import { createTemplate, updateTemplate, getTemplateById, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
+import { createTemplate, updateTemplate, getTemplateById, readTemplateFromLocalCache, mapTemplateRecordToProjectTemplate } from "../../lib/templateApi";
 import { normalizeShapePreviewSvg, type ShapeItem } from "../../lib/shapesGallery";
 
 // --- Types --------------------------------------------------------------------
@@ -369,6 +369,7 @@ function ToolBtn({
 
 export function DesignerStudio() {
   const navigate = useNavigate();
+  const location = useLocation();
   const canvasRef       = useRef<FabricCanvasHandle | null>(null);
   const imageInputRef   = useRef<HTMLInputElement>(null);
   const svgInputRef     = useRef<HTMLInputElement>(null);
@@ -549,12 +550,45 @@ export function DesignerStudio() {
     });
   };
   const initialTemplateLoadDoneRef = useRef(false);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  // Incrementing this triggers the load effect to retry the template fetch.
+  const [templateLoadNonce, setTemplateLoadNonce] = useState(0);
 
-  // -- Designer context -------------------------------------------------------
+  const handleRetryTemplateLoad = useCallback(() => {
+    setTemplateError(null);
+    setTemplateLoadNonce((n) => n + 1);
+  }, []);
+
+  const handleSkipTemplateLoad = useCallback(() => {
+    setTemplateLoading(false);
+    setTemplateError(null);
+    initialTemplateLoadDoneRef.current = true;
+  }, []);
+  // URL ?templateId= takes precedence over localStorage so that clicking
+  // "Use Template" in the gallery always opens the correct template even when
+  // localStorage still holds a stale context from a previous session.
+  const [searchParams] = useSearchParams();
   const [designerContext, setDesignerContext] = useState<DesignerContext | null>(() => {
-    try { const raw = localStorage.getItem(DESIGNER_CONTEXT_KEY); return raw ? JSON.parse(raw) : null; }
-    catch { return null; }
+    try {
+      const urlTemplateId = new URLSearchParams(window.location.search).get('templateId');
+      const raw = localStorage.getItem(DESIGNER_CONTEXT_KEY);
+      const stored: DesignerContext | null = raw ? JSON.parse(raw) : null;
+      if (urlTemplateId && MONGO_ID_REGEX.test(urlTemplateId) && stored?.templateId !== urlTemplateId) {
+        // URL has a different (newer) templateId — use it, keep other stored fields
+        const merged: DesignerContext = {
+          projectId: stored?.projectId ?? '',
+          templateId: urlTemplateId,
+          projectName: stored?.projectName ?? '',
+          templateName: stored?.templateName ?? '',
+        };
+        localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify(merged));
+        return merged;
+      }
+      return stored;
+    } catch { return null; }
   });
+  void searchParams; // used above via window.location.search at init time
 
   // -- Save dialog ------------------------------------------------------------
   const [saveDialogOpen,   setSaveDialogOpen]   = useState(false);
@@ -943,7 +977,31 @@ export function DesignerStudio() {
       }
 
       try {
-        const remote = await getTemplateById(designerContext.templateId);
+        // Priority order:
+        // 1. localStorage template cache (instant, survives page refresh, populated on first success)
+        // 2. Navigation state preloadedTemplate (passed from gallery when cache hit there)
+        // 3. API fetch (may take 60-120 s on Atlas M0 cold start)
+        const localCached = readTemplateFromLocalCache(designerContext.templateId);
+        const navState = location.state as Record<string, unknown> | null;
+        const preloaded = navState?.preloadedTemplate as Record<string, unknown> | undefined;
+        const navHasDesignData = preloaded &&
+          String((preloaded as any)._id ?? '') === designerContext.templateId &&
+          !!(preloaded as any).designData &&
+          !!(preloaded as any).designData?.canvasJSON;
+        let remote: Record<string, any>;
+        if (localCached) {
+          remote = localCached as any;
+        } else if (navHasDesignData) {
+          remote = preloaded as any;
+        } else {
+          // Need to fetch from server. Atlas M0 may take 60-120 s on cold start.
+          if (mounted) setTemplateLoading(true);
+          try {
+            remote = await getTemplateById(designerContext.templateId);
+          } finally {
+            if (mounted) setTemplateLoading(false);
+          }
+        }
         if (!mounted) return;
 
         const tmpl = mapTemplateRecordToProjectTemplate(remote);
@@ -1005,10 +1063,12 @@ export function DesignerStudio() {
         }, 300);
 
         return () => clearTimeout(timer);
-      } catch {
+      } catch (err) {
         if (mounted) {
+          setTemplateLoading(false);
           initialTemplateLoadDoneRef.current = true;
-          toast.error("Template could not be loaded from the server.");
+          const msg = err instanceof Error ? err.message : 'Unknown error';
+          setTemplateError(msg);
         }
       }
     };
@@ -1016,8 +1076,7 @@ export function DesignerStudio() {
     void loadTemplate();
     return () => { mounted = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [templateLoadNonce]);
 
   useEffect(() => {
     const activePage = pages.find((p) => p.id === activePageId);
@@ -1859,6 +1918,43 @@ export function DesignerStudio() {
               <div style={{ display: "flex" }}>
                 <VRuler canvasPxH={displayPxH} canvasMmH={config.canvas.height} scale={rulerScale} />
                 <div style={{ position: "relative" }}>
+                  {/* Loading overlay while fetching template from Atlas M0 */}
+                  {(templateLoading || templateError) && (
+                    <div
+                      style={{ width: displayPxW, height: displayPxH }}
+                      className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm rounded"
+                    >
+                      {templateError ? (
+                        <>
+                          <div className="text-destructive text-4xl mb-3">⚠</div>
+                          <p className="text-sm font-medium mb-1">Template could not be loaded</p>
+                          <p className="text-xs text-muted-foreground mb-4 text-center max-w-[220px]">
+                            The server may still be waking up. Click Retry in a moment.
+                          </p>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={handleRetryTemplateLoad}
+                              className="px-4 py-1.5 rounded bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+                            >
+                              Retry
+                            </button>
+                            <button
+                              onClick={handleSkipTemplateLoad}
+                              className="px-4 py-1.5 rounded border text-sm hover:bg-muted transition-colors"
+                            >
+                              Skip (blank canvas)
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <Loader2 className="h-8 w-8 animate-spin text-primary mb-3" />
+                          <p className="text-sm text-muted-foreground">Loading template…</p>
+                          <p className="text-xs text-muted-foreground/70 mt-1">Server may be waking up, please wait</p>
+                        </>
+                      )}
+                    </div>
+                  )}
                   <FabricCanvas
                     ref={canvasRef}
                     config={config}

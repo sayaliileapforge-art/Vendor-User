@@ -665,13 +665,27 @@ export function ProjectDetail() {
   const [previewTemplate, setPreviewTemplate] = useState<ProjectTemplate | null>(null);
   const [brokenTemplatePreviewIds, setBrokenTemplatePreviewIds] = useState<Record<string, true>>({});
   const [activeTab, setActiveTab] = useState(() => searchParams.get("tab") || "details");
-  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>([]);
+  // Pre-populate from localStorage so templates appear instantly after refresh while
+  // the DB fetch runs in the background. The fetch will either confirm these (override)
+  // or fail gracefully (these remain visible with an error banner).
+  const [remoteTemplates, setRemoteTemplates] = useState<PreviewTemplateOption[]>(() => {
+    if (!id) return [];
+    try {
+      return loadProjectTemplates(id)
+        .filter((t) => t.projectId === id && (isMongoId(t.id) || isMongoId(t.remoteId)))
+        .map((t) => ({ ...t, isGlobal: t.isPublic ?? false }));
+    } catch { return []; }
+  });
   const [remoteTemplatesLoading, setRemoteTemplatesLoading] = useState(false);
   const [remoteTemplatesError, setRemoteTemplatesError] = useState("");
   const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<ProjectTemplate | null>(null);
   const [isDeletingTemplate, setIsDeletingTemplate] = useState(false);
   const templateMigrationRef = useRef(false);
   const realtimeRefreshRef = useRef<number | null>(null);
+  // Separate version counter for templates-only re-fetch.
+  // Incrementing this triggers a template reload without touching project data.
+  const [templateFetchVersion, setTemplateFetchVersion] = useState(0);
+  const refetchTemplates = useCallback(() => setTemplateFetchVersion((v) => v + 1), []);
 
   // Sync activeTab when the URL ?tab= param changes (e.g., after returning from Template Gallery)
   useEffect(() => {
@@ -679,8 +693,39 @@ export function ProjectDetail() {
     if (tabFromUrl) setActiveTab(tabFromUrl);
   }, [searchParams]);
 
+  // When returning from Template Gallery after attaching a template, immediately
+  // add the new template to remoteTemplates so it appears without waiting for
+  // the async Atlas DB re-fetch (which can be slow on Atlas M0).
+  useEffect(() => {
+    const attached = (location.state as Record<string, unknown> | null)?.justAttachedTemplate;
+    if (!attached) return;
+    const mapped = mapApiTemplateToProjectTemplate(attached as TemplateRecord);
+    setRemoteTemplates((prev) => {
+      if (prev.some((t) => t.id === mapped.id)) return prev;
+      const next = [...prev, mapped];
+      syncProjectTemplatesFromRemote(id ?? '', next);
+      return next;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state]);
+
   useEffect(() => {
     templateMigrationRef.current = false;
+    // When the project id changes (user navigates to a different project),
+    // reset remoteTemplates to the localStorage preload for the new project
+    // so we don't flash the previous project's templates while the fetch runs.
+    if (!id) {
+      setRemoteTemplates([]);
+      return;
+    }
+    try {
+      const preload = loadProjectTemplates(id)
+        .filter((t) => t.projectId === id && (isMongoId(t.id) || isMongoId(t.remoteId)))
+        .map((t) => ({ ...t, isGlobal: t.isPublic ?? false }));
+      setRemoteTemplates(preload);
+    } catch {
+      setRemoteTemplates([]);
+    }
   }, [id]);
 
   const updateTemplateMargin = (key: keyof typeof emptyTemplateForm.margin, val: number) =>
@@ -780,13 +825,12 @@ export function ProjectDetail() {
         if (!mounted) return;
         const isAbort = error instanceof Error && error.name === 'AbortError';
         console.warn("[preview] Failed to load templates", error);
-        // On timeout keep any existing optimistic template state rather than clearing it.
-        if (!isAbort) {
-          setRemoteTemplates([]);
-        }
+        // Preserve existing state (from localStorage preload or a previous successful fetch).
+        // Never wipe templates because of a transient error — the user's data is still in
+        // MongoDB; we just couldn't reach it this time (Atlas M0 cold start, network hiccup).
         setRemoteTemplatesError(
           isAbort
-            ? "Template load timed out. Please refresh the page."
+            ? "Templates loading slowly (server waking up). Showing cached data — refresh to retry."
             : (error as Error).message || "Failed to load templates"
         );
       })
@@ -800,9 +844,12 @@ export function ProjectDetail() {
       window.clearTimeout(timeoutId);
       controller.abort();
     };
-  // location.key changes on every navigation — ensures a fresh fetch when the user
-  // returns from Template Gallery to this same project URL.
-  }, [id, version, location.key]);
+  // templateFetchVersion increments only when templates need a hard re-fetch
+  // (after create/delete/attach/detach). location.key changes when navigating
+  // back from Template Gallery to pick up newly attached templates.
+  // version is intentionally excluded: project-level refresh must not re-trigger
+  // a template fetch (which shows the spinner again unnecessarily).
+  }, [id, templateFetchVersion, location.key]);
 
   // Load data
   const products = id ? loadProjectProducts(id) : [];
@@ -810,29 +857,35 @@ export function ProjectDetail() {
   const files = id ? loadProjectFiles(id) : [];
   const templates = id ? loadProjectTemplates(id, project?.clientId ?? "") : [];
   const previewTemplates = useMemo(() => {
-    // DB (remoteTemplates) is ALWAYS the single source of truth.
-    // Every browser fetches from the same MongoDB, so all browsers show identical data.
-    // Local-only templates (no remoteId AND not a Mongo ID — legacy TMPL-xxx records
-    // that haven't been migrated yet) are appended as a fallback only when they have
-    // no DB equivalent. This prevents stale localStorage from masking fresh DB data.
+    // DB (remoteTemplates) is the single source of truth for live data.
+    // localStorage templates serve as:
+    //   a) the pre-populated initial state (set at useState init time), and
+    //   b) a fallback for unmigrated local-only templates (TMPL-xxx IDs).
     const merged = new Map<string, PreviewTemplateOption>();
 
-    // Step 1: DB templates take unconditional priority.
+    // Step 1: DB templates (or localStorage preload) take unconditional priority.
     remoteTemplates.forEach((t) => merged.set(t.id, t));
 
-    // Step 2: Append local-only templates that have no DB equivalent.
+    // Step 2: Append local-only templates not yet represented in remoteTemplates.
+    // Includes:
+    //   - Legacy TMPL-xxx records not yet migrated to DB (!isMongoId(t.id))
+    //   - DB-backed templates whose remoteId isn't in the current remoteTemplates set
+    //     (e.g., a new template created just before a failed refresh)
     const remoteIds = new Set(remoteTemplates.map((t) => t.id));
+    const remoteByRemoteId = new Set(remoteTemplates.map((t) => t.remoteId).filter(Boolean));
     templates.forEach((t) => {
-      // A template is considered synced when its remoteId is known to the DB,
-      // or when its own id is already a MongoDB ObjectId (fetched from DB previously).
-      const syncedToRemote = t.remoteId ? remoteIds.has(t.remoteId) : false;
-      if (!syncedToRemote && !isMongoId(t.id) && !merged.has(t.id)) {
-        merged.set(t.id, { ...t, isGlobal: false });
+      if (merged.has(t.id)) return; // already in merged (was in remoteTemplates preload)
+      const syncedById = remoteIds.has(t.id) || (t.remoteId ? remoteIds.has(t.remoteId) : false);
+      const syncedByRemoteId = t.remoteId ? remoteByRemoteId.has(t.remoteId) : false;
+      if (!syncedById && !syncedByRemoteId && t.projectId === id) {
+        // Include both migrated DB templates (as fallback when DB is unreachable)
+        // and unmigrated local-only templates.
+        merged.set(t.id, { ...t, isGlobal: t.isPublic ?? false });
       }
     });
 
     return Array.from(merged.values());
-  }, [remoteTemplates, templates]);
+  }, [remoteTemplates, templates, id]);
 
   const previewTemplateGroups = useMemo(() => {
     // A template belongs to this project if it was created here (projectId === id),
@@ -930,29 +983,28 @@ export function ProjectDetail() {
   useEffect(() => {
     if (!id) return;
     const unsubscribe = subscribeToTemplateUpdates(id, () => {
+      // SSE event: debounce and re-fetch ONLY templates (not project metadata).
+      // Do NOT call refresh() here — that increments version, re-fetches project,
+      // and shows the template spinner on every real-time event.
       if (realtimeRefreshRef.current) return;
       realtimeRefreshRef.current = window.setTimeout(() => {
         realtimeRefreshRef.current = null;
-        refresh();
-      }, 250);
+        refetchTemplates();
+      }, 2_000); // 2 s debounce — avoids spinner on burst saves
     });
 
-    // Polling fallback: re-fetch templates every 30 s in case SSE is not reliable in production.
-    const pollInterval = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        refresh();
-      }
-    }, 30_000);
+    // 30 s polling intentionally removed. It was causing the continuous
+    // "Loading templates…" flicker. SSE events handle real-time updates;
+    // manual actions call refetchTemplates() directly.
 
     return () => {
       if (realtimeRefreshRef.current) {
         window.clearTimeout(realtimeRefreshRef.current);
         realtimeRefreshRef.current = null;
       }
-      window.clearInterval(pollInterval);
       unsubscribe();
     };
-  }, [id]);
+  }, [id, refetchTemplates]);
 
   // ── Template handlers ──
   const validateTemplate = () => {
@@ -1059,7 +1111,7 @@ export function ProjectDetail() {
       // Only refresh on failure so the UI reflects the actual DB state.
       // On success the optimistic setRemoteTemplates update is the source of truth
       // until the user returns from Designer Studio (which triggers a fresh fetch via location.key).
-      refresh();
+      refetchTemplates();
     } finally {
       setIsTemplateSaving(false);
     }
@@ -1088,7 +1140,7 @@ export function ProjectDetail() {
       } else {
         // Local-only template (never synced) — remove from localStorage only.
         deleteProjectTemplate(template.id);
-        refresh();
+        refetchTemplates();
       }
       toast.success(`"${template.templateName}" removed from project.`);
       setDeleteConfirmTemplate(null);
@@ -2746,6 +2798,20 @@ export function ProjectDetail() {
               </div>
             </CardHeader>
             <CardContent>
+              {remoteTemplatesError && (
+                <div className="mb-3 flex items-center gap-2 rounded-md border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  <span>{remoteTemplatesError}</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto h-6 px-2 text-xs text-yellow-800 hover:bg-yellow-100"
+                    onClick={() => { setRemoteTemplatesError(""); refetchTemplates(); }}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              )}
               {remoteTemplatesLoading && previewTemplates.length === 0 ? (
                 <div className="text-center py-12">
                   <Loader2 className="h-8 w-8 mx-auto text-muted-foreground mb-3 animate-spin" />

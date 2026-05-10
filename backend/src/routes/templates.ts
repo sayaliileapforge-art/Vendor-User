@@ -344,7 +344,6 @@ router.get('/', async (req: Request, res: Response) => {
     if (requestedProductId) {
       const productConditions: Record<string, any>[] = [
         { productId: requestedProductId },
-        { isGlobal: true },
       ];
       if (isValidObjectId(requestedProductId)) {
         productConditions.push({ productId: new mongoose.Types.ObjectId(requestedProductId) });
@@ -353,14 +352,15 @@ router.get('/', async (req: Request, res: Response) => {
     } else if (requestedProjectId) {
       // Match both projectId (string field) AND productId (ObjectId field) for backward compat —
       // older templates stored the projectId in productId before this fix was applied.
+      // Do NOT include isGlobal:true here — global templates belong to the Template Gallery,
+      // not to individual project template lists. Including them would fetch all global
+      // templates (with large designData blobs) for every project, causing slow loads.
       const projectConditions: Record<string, any>[] = [
         { projectId: requestedProjectId },
       ];
       if (isValidObjectId(requestedProjectId)) {
         projectConditions.push({ productId: new mongoose.Types.ObjectId(requestedProjectId) });
       }
-      // Include global templates so all users see shared designs.
-      projectConditions.push({ isGlobal: true });
       filter = { $or: projectConditions };
     } else {
       // Gallery mode (no productId / projectId): only return public global templates.
@@ -379,15 +379,17 @@ router.get('/', async (req: Request, res: Response) => {
     //     {isGlobal:1,updatedAt:-1} compound index — no in-memory sort, no OOM.
     //   • Project/product uses $or (no single compound index covers all branches) — skip sort
     //     to avoid OOM; the order doesn't matter for project template lists.
+    // Non-gallery queries: let the query run until the frontend AbortController fires (45 s).
+    // A hard backend timeout shorter than the Atlas M0 cold-storage wake time (60-120 s) would
+    // return a 500 before Atlas is ready, causing the frontend to clear the template list.
+    // The frontend abort produces an AbortError which already preserves template state.
     const rawTemplates = isGalleryMode
       ? await ProductTemplate
           .find(filter)
           .select(GALLERY_SELECT_FIELDS)
           .sort({ updatedAt: -1 })
           .lean<Array<Record<string, any>>>()
-      : await ProductTemplate
-          .find(filter)
-          .lean<Array<Record<string, any>>>();
+      : await ProductTemplate.find(filter).lean<Array<Record<string, any>>>();
 
     // Normalize preview fields — Mongoose toJSON transform doesn't run on lean() results.
     const normalizedTemplates = rawTemplates.map(normalizeLeanTemplate);
@@ -480,7 +482,16 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const template = await ProductTemplate.findById(id);
+    // Use a timeout race so Atlas M0 cold-storage reads don't hang indefinitely.
+    // 120 s gives Atlas M0 enough time to fully wake from cold storage
+    // (typically 15-90 s; the frontend retries if this fires).
+    const TEMPLATE_FETCH_TIMEOUT_MS = 120_000;
+    const fetchPromise = ProductTemplate.findById(id).lean<Record<string, any>>();
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Template fetch timed out after ${TEMPLATE_FETCH_TIMEOUT_MS}ms`)), TEMPLATE_FETCH_TIMEOUT_MS)
+    );
+    const template = await Promise.race([fetchPromise, timeoutPromise]);
+
     if (!template) {
       res.status(404).json({ success: false, error: 'Template not found' });
       return;
@@ -490,11 +501,12 @@ router.get('/:id', async (req: Request, res: Response) => {
     res.json({ success: true, data: template });
   } catch (error) {
     const err = error as Error;
+    const isTimeout = err.message?.includes('timed out');
     console.error('[templates] GET /api/templates/:id failed', {
       error: err.message,
-      stack: err.stack,
+      stack: isTimeout ? undefined : err.stack,
     });
-    res.status(500).json({ success: false, error: err.message });
+    res.status(isTimeout ? 504 : 500).json({ success: false, error: err.message });
   }
 });
 

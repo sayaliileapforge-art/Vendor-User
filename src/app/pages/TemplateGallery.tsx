@@ -6,7 +6,7 @@ import {
   MoreVertical, Pencil, Copy, Trash2, Info,
 } from "lucide-react";
 import { cn } from "../components/ui/utils";
-import { getTemplates, createTemplate, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
+import { getTemplates, createTemplate, getTemplateById, readTemplateFromLocalCache, resolveTemplatePreview, type TemplateRecord } from "../../lib/templateApi";
 import { subscribeToTemplateUpdates } from "../../lib/realtime";
 import { DESIGNER_CONTEXT_KEY } from "../../lib/fabricUtils";
 import { toast } from "sonner";
@@ -466,13 +466,14 @@ export function TemplateGallery() {
   }, [fetchTemplates]);
 
   // SSE real-time updates: refresh gallery when templates change on the server.
+  // Debounce to 2 s so rapid bursts of SSE events don't thrash the API.
   useEffect(() => {
     const unsubscribe = subscribeToTemplateUpdates(undefined, () => {
-      if (realtimeRefreshRef.current) return;
+      if (realtimeRefreshRef.current) return; // already pending
       realtimeRefreshRef.current = window.setTimeout(() => {
         realtimeRefreshRef.current = null;
-        fetchTemplates();
-      }, 300);
+        fetchTemplates(true);
+      }, 2_000);
     });
 
     return () => {
@@ -480,31 +481,15 @@ export function TemplateGallery() {
         window.clearTimeout(realtimeRefreshRef.current);
         realtimeRefreshRef.current = null;
       }
-      unsubscribe();
-    };
-  }, [fetchTemplates]);
-
-  // Polling fallback: refresh every 30 seconds in case SSE is unavailable in production
-  // (e.g. Render's HTTP proxy drops long-lived connections).
-  useEffect(() => {
-    pollingIntervalRef.current = window.setInterval(() => {
-      // Only poll when the tab is visible to avoid unnecessary requests while backgrounded.
-      if (document.visibilityState === 'visible') {
-        fetchTemplates();
-      }
-    }, 30_000);
-
-    return () => {
-      if (pollingIntervalRef.current !== null) {
-        window.clearInterval(pollingIntervalRef.current);
-        pollingIntervalRef.current = null;
-      }
       if (retryTimerRef.current !== null) {
         window.clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
+      unsubscribe();
     };
   }, [fetchTemplates]);
+  // NOTE: Polling removed — gallery data comes from file cache served instantly;
+  // SSE handles live updates. Polling every 30s was causing repeated UI resets.
 
   useEffect(() => { localStorage.setItem("tg_favorites", JSON.stringify(favorites)); }, [favorites]);
   useEffect(() => { localStorage.setItem("tg_recent", JSON.stringify(recentlyUsed)); }, [recentlyUsed]);
@@ -554,13 +539,22 @@ export function TemplateGallery() {
       // Attach mode: clone the global template into the project
       setAttachingTemplateId(t._id);
       try {
+        // The gallery returns lean meta docs (no designData). Fetch the full
+        // template first so the project copy contains the actual canvas design.
+        let fullDesignData: Record<string, any> = {};
+        try {
+          const full = await getTemplateById(t._id);
+          fullDesignData = (full.designData as Record<string, any>) ?? {};
+        } catch {
+          // Non-fatal: attach proceeds with empty designData if fetch fails
+        }
         const result = await createTemplate({
           productId: projectId,
           projectId: projectId,
           templateName: t.templateName,
           preview_image: resolveTemplatePreview(t),
           category: (t.category as any) || "Other",
-          designData: t.designData ?? {},
+          designData: fullDesignData,
           isGlobal: false,
           isPublic: false,
         }) as any;
@@ -570,7 +564,11 @@ export function TemplateGallery() {
         } else {
           toast.success(`"${t.templateName}" attached to project.`);
         }
-        navigate(`/projects/${projectId}?tab=templates`);
+        // Pass the created template via navigation state so ProjectDetail can
+        // display it immediately without waiting for the async DB re-fetch.
+        navigate(`/projects/${projectId}?tab=templates`, {
+          state: { justAttachedTemplate: result },
+        });
       } catch (err) {
         toast.error((err as Error).message || "Failed to attach template to project.");
       } finally {
@@ -580,7 +578,22 @@ export function TemplateGallery() {
     }
     // Gallery mode: open in Designer Studio
     setRecentlyUsed((prev) => [t._id, ...prev.filter((id) => id !== t._id)].slice(0, 20));
-    navigate(`/designer-studio?templateId=${t._id}`);
+    // Set designer context so DesignerStudio can load the correct template
+    // immediately without relying on stale localStorage from a previous session.
+    localStorage.setItem(DESIGNER_CONTEXT_KEY, JSON.stringify({
+      projectId: '',
+      templateId: t._id,
+      projectName: '',
+      templateName: t.templateName,
+    }));
+    // Check the localStorage template cache first — if this template was loaded
+    // before, we have the full designData instantly. Otherwise navigate immediately
+    // and let DesignerStudio handle fetching (with retry/skip UI).  This removes
+    // the 45 s blocking spinner that previously blocked navigation on Atlas M0.
+    const cachedFull = readTemplateFromLocalCache(t._id);
+    navigate(`/designer-studio?templateId=${t._id}`, {
+      state: { preloadedTemplate: cachedFull ?? t },
+    });
   };
 
   const toggleFavorite = (id: string) =>

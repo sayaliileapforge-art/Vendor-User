@@ -133,9 +133,42 @@ function withTimeout(ms: number): { signal: AbortSignal; clear: () => void } {
   return { signal: controller.signal, clear: () => window.clearTimeout(id) };
 }
 
-// Render free-tier cold starts can take up to 50 s. Use 45 s so the first
-// request after a spin-down survives the wake-up without timing out.
-const FETCH_TIMEOUT_MS = 45_000;
+// Atlas M0 cold-storage reads can take 60-120 s to complete.
+// Frontend timeout matches the backend limit so we get a proper error, not a silent hang.
+const FETCH_TIMEOUT_MS = 130_000;
+
+// ---------------------------------------------------------------------------
+// localStorage template cache
+// Stores the full template record (including designData / canvasJSON) so that
+// Atlas M0 cold-read delays only block the VERY FIRST open of each template.
+// All subsequent opens are instant, even across page refreshes.
+// ---------------------------------------------------------------------------
+const TEMPLATE_CACHE_PREFIX = 'tmpl_v1_';
+const TEMPLATE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+interface LocalTemplateCache { data: TemplateRecord; cachedAt: number; }
+
+/** Read a full template record from localStorage. Returns null if not cached or expired. */
+export function readTemplateFromLocalCache(id: string): TemplateRecord | null {
+  try {
+    const raw = localStorage.getItem(TEMPLATE_CACHE_PREFIX + id);
+    if (!raw) return null;
+    const parsed: LocalTemplateCache = JSON.parse(raw);
+    if (Date.now() - parsed.cachedAt > TEMPLATE_CACHE_TTL_MS) {
+      localStorage.removeItem(TEMPLATE_CACHE_PREFIX + id);
+      return null;
+    }
+    return parsed.data;
+  } catch { return null; }
+}
+
+/** Write a full template record to localStorage. Silently ignores storage-full errors. */
+export function writeTemplateToLocalCache(id: string, template: TemplateRecord): void {
+  try {
+    const entry: LocalTemplateCache = { data: template, cachedAt: Date.now() };
+    localStorage.setItem(TEMPLATE_CACHE_PREFIX + id, JSON.stringify(entry));
+  } catch { /* quota exceeded — non-fatal */ }
+}
 
 export async function getTemplatesByProductId(productId: string, params?: { category?: string; search?: string }): Promise<TemplateRecord[]> {
   const query = new URLSearchParams();
@@ -191,12 +224,22 @@ export async function getTemplates(params?: { productId?: string }): Promise<Tem
 }
 
 export async function getTemplateById(templateId: string): Promise<TemplateRecord> {
+  // Check localStorage first — avoids cold Atlas M0 reads after the first successful load.
+  const cached = readTemplateFromLocalCache(templateId);
+  if (cached) {
+    console.info('[templateApi] GET template by id (localStorage cache hit)', { id: templateId });
+    return cached;
+  }
+
   const requestUrl = `${TEMPLATE_API_BASE}/${templateId}`;
   const { signal, clear } = withTimeout(FETCH_TIMEOUT_MS);
   try {
     const response = await fetch(requestUrl, { cache: 'no-store', signal });
     console.info('[templateApi] GET template by id', { url: requestUrl, status: response.status });
-    return handleResponse<TemplateRecord>(response);
+    const template = await handleResponse<TemplateRecord>(response);
+    // Cache for future instant loads (across refreshes and sessions).
+    writeTemplateToLocalCache(templateId, template);
+    return template;
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error('Template request timed out. Please try again.');
@@ -227,7 +270,10 @@ export async function createTemplate(input: TemplateSaveInput): Promise<Template
   if (!response.ok || json.success === false) {
     throw new Error(json.error || json.message || `Request failed with status ${response.status}`);
   }
-  return { ...(json.data as TemplateRecord), alreadyExists: json.alreadyExists };
+  const result = { ...(json.data as TemplateRecord), alreadyExists: json.alreadyExists };
+  // Cache the created template so subsequent getTemplateById calls are instant.
+  if (result._id) writeTemplateToLocalCache(result._id, result);
+  return result;
 }
 
 export async function createTemplateWithImage(input: TemplateUploadInput): Promise<TemplateRecord> {
@@ -261,7 +307,11 @@ export async function updateTemplate(templateId: string, input: Partial<Template
     }),
   });
 
-  return handleResponse<TemplateRecord>(response);
+  const updated = await handleResponse<TemplateRecord>(response);
+  // Keep the tmpl_v1_ localStorage cache in sync so the designer and project
+  // template list always load the latest canvas data, not a 7-day-old snapshot.
+  writeTemplateToLocalCache(templateId, updated);
+  return updated;
 }
 
 export async function deleteTemplate(templateId: string): Promise<void> {
@@ -269,6 +319,8 @@ export async function deleteTemplate(templateId: string): Promise<void> {
     method: 'DELETE',
   });
   await handleResponse<unknown>(response);
+  // Evict from localStorage cache so the deleted template is not served from cache.
+  try { localStorage.removeItem(TEMPLATE_CACHE_PREFIX + templateId); } catch { /* non-fatal */ }
 }
 
 /**
